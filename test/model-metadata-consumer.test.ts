@@ -13,7 +13,6 @@ describe("runtime model metadata", () => {
       env: {},
       contextWindow: 128_000,
       maxTokens: 16_384,
-      allowTools: false,
       modelOverrides: {},
     };
     const catalogModel = {
@@ -36,8 +35,8 @@ describe("runtime model metadata", () => {
   test("resolves Copilot and Cursor model metadata through their OMP provider catalogs", () => {
     const catalogModel = { contextWindow: 256_000, maxTokens: 32_000 } as unknown as OmpModel;
     const agents = [
-      { id: "copilot", name: "Copilot", command: "copilot", args: [], env: {}, contextWindow: 128_000, maxTokens: 16_384, allowTools: false, modelOverrides: {}, metadataProvider: "github-copilot" },
-      { id: "cursor", name: "Cursor", command: "cursor-agent", args: [], env: {}, contextWindow: 128_000, maxTokens: 16_384, allowTools: false, modelOverrides: {}, metadataProvider: "cursor" },
+      { id: "copilot", name: "Copilot", command: "copilot", args: [], env: {}, contextWindow: 128_000, maxTokens: 16_384, modelOverrides: {}, metadataProvider: "github-copilot" },
+      { id: "cursor", name: "Cursor", command: "cursor-agent", args: [], env: {}, contextWindow: 128_000, maxTokens: 16_384, modelOverrides: {}, metadataProvider: "cursor" },
     ];
     const models = {
       resolve: (id: string) => id === "github-copilot/example" || id === "cursor/example" ? catalogModel : undefined,

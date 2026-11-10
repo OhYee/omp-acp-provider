@@ -12,17 +12,17 @@ function textOf(message: AssistantMessage): string {
 }
 
 describe("ACP provider config and prompt", () => {
-  test("registers separate valid agents and keeps tool permission opt-in", () => {
+  test("registers separate agents and preserves client-specific arguments", () => {
     const dir = mkdtempSync(join(tmpdir(), "omp-acp-provider-"));
     const path = join(dir, "config.json");
     try {
       writeFileSync(path, JSON.stringify({ agents: [
         { id: "first", command: "agent-a", args: ["acp"], contextWindow: 64000 },
-        { id: "second", name: "Second", command: "agent-b", allowTools: true },
+        { id: "second", name: "Second", command: "agent-b", args: ["--acp", "--tools", ""] },
       ] }));
       const agents = __testing.readAgents(path);
       expect(agents.map(agent => agent.id)).toEqual(["first", "second"]);
-      expect(agents.map(agent => agent.allowTools)).toEqual([false, true]);
+      expect(agents[1]?.args).toEqual(["--acp", "--tools", ""]);
       expect(agents[0]?.contextWindow).toBe(64000);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -54,7 +54,7 @@ describe("ACP provider config and prompt", () => {
         ["bob", "bob", ["acp"]],
         ["claude", "claude-agent-acp", []],
         ["cline", "cline", ["--acp"]],
-        ["codebuddy", "codebuddy", ["--acp"]],
+        ["codebuddy", "codebuddy", ["--acp", "--tools", ""]],
         ["codex", "codex-acp", []],
         ["copilot", "copilot", ["--acp"]],
         ["cursor", "cursor-agent", ["acp"]],
@@ -102,14 +102,26 @@ describe("ACP provider config and prompt", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test("maps configured tool policy to one-shot ACP permission responses", () => {
+  test("allows native CodeBuddy arguments to override preset tool filtering", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omp-acp-provider-"));
+    const path = join(dir, "config.json");
+    try {
+      writeFileSync(path, JSON.stringify({
+        auto: { codebuddy: true },
+        agents: [{ id: "codebuddy", args: ["--acp", "--tools", "Read,Glob"] }],
+      }));
+      expect(__testing.readAgents(path)[0]?.args).toEqual(["--acp", "--tools", "Read,Glob"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("auto-approves ACP permission requests for one operation only", () => {
     const options = [
       { optionId: "allow-once", name: "Allow once", kind: "allow_once" as const },
+      { optionId: "allow-always", name: "Allow always", kind: "allow_always" as const },
       { optionId: "reject-once", name: "Reject once", kind: "reject_once" as const },
     ];
-    expect(__testing.permissionResponse(true, options)).toEqual({ outcome: { outcome: "selected", optionId: "allow-once" } });
-    expect(__testing.permissionResponse(false, options)).toEqual({ outcome: { outcome: "selected", optionId: "reject-once" } });
-    expect(__testing.permissionResponse(true, [])).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(__testing.allowPermissionRequest(options)).toEqual({ outcome: { outcome: "selected", optionId: "allow-once" } });
+    expect(__testing.allowPermissionRequest([options[1]!, options[2]!])).toEqual({ outcome: { outcome: "cancelled" } });
   });
 
   test("discovers ACP models, selects the requested one, and streams its answer", async () => {
@@ -196,8 +208,7 @@ describe("ACP provider config and prompt", () => {
       }));
       writeFileSync(join(dir, "acp-provider.json"), JSON.stringify({ agents: [
         { id: "mock", command: process.execPath, args: ["-e", acpServer], contextWindow: 4096, metadataProvider: "test-catalog" },
-        { id: "allowed", command: process.execPath, args: ["-e", acpServer], contextWindow: 16384, allowTools: true },
-        { id: "broken", command: join(dir, "missing-agent"), contextWindow: 8192, allowTools: true },
+        { id: "broken", command: join(dir, "missing-agent"), contextWindow: 8192 },
         { id: "noisy", command: process.execPath, args: ["-e", noisyAgent], contextWindow: 4096 },
         { id: "codebuddy", command: process.execPath, args: ["-e", acpServer], contextWindow: 128000 },
         { id: "opencode", command: process.execPath, args: ["-e", acpServer], contextWindow: 128000, metadataProvider: "openai" },
@@ -233,11 +244,9 @@ describe("ACP provider config and prompt", () => {
         },
       });
       const registered = registrations.get("acp-mock");
-      const allowed = registrations.get("acp-allowed");
       const broken = registrations.get("acp-broken");
       const codebuddy = registrations.get("acp-codebuddy");
       expect(registered?.models?.[0]?.contextWindow).toBe(4096);
-      expect(allowed?.models?.[0]?.contextWindow).toBe(16384);
       expect(broken?.models?.[0]?.contextWindow).toBe(8192);
       const models = await registered?.fetchDynamicModels?.("unused");
       const model = models?.find(candidate => candidate.id === "mock/m2");
@@ -253,8 +262,8 @@ describe("ACP provider config and prompt", () => {
         maxTokens: 96_000,
         cost: { input: 0.2, output: 0.8, cacheRead: 0.02, cacheWrite: 0 },
       });
-      if (!registered?.streamSimple || !allowed?.streamSimple || !allowed.models?.[0] || !model) {
-        throw new Error("Configured ACP providers or discovered model were not registered");
+      if (!registered?.streamSimple || !model) {
+        throw new Error("Configured ACP provider or discovered model was not registered");
       }
       const context = {
         systemPrompt: ["system rule"],
@@ -268,8 +277,8 @@ describe("ACP provider config and prompt", () => {
       const result = await stream.result();
       const resultText = textOf(result);
       expect(resultText).toContain("selected model");
-      expect(resultText).toContain("permission denied");
-      expect(resultText).toContain("✗ Mock read");
+      expect(resultText).toContain("permission granted");
+      expect(resultText).toContain("✓ Mock read");
       expect(result.usage).toMatchObject({ contextTokens: 321, cost: { total: 0.012 } });
       const updatedModels = await registered.fetchDynamicModels?.("unused");
       expect(updatedModels?.find(candidate => candidate.id === "mock/m2")?.contextWindow).toBe(32768);
@@ -289,13 +298,6 @@ describe("ACP provider config and prompt", () => {
       ).result();
       expect(textOf(secondResult)).toContain("history replayed");
 
-      const allowedResult = await allowed.streamSimple(
-        allowed.models[0] as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0],
-        context,
-        { cwd: dir },
-      ).result();
-      expect(textOf(allowedResult)).toContain("permission granted");
-      expect(textOf(allowedResult)).toContain("✓ Mock read");
 
       if (!broken?.streamSimple || !broken.models?.[0]) throw new Error("Second ACP provider was not registered");
       const failed = await broken.streamSimple(broken.models[0] as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0], context, { cwd: dir }).result();

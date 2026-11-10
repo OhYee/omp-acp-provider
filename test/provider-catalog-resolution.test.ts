@@ -30,7 +30,6 @@ describe("ACP provider-aware model metadata", () => {
       env: {},
       contextWindow: 128_000,
       maxTokens: 16_384,
-      allowTools: false,
       modelOverrides: {},
     };
 

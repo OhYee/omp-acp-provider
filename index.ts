@@ -21,7 +21,6 @@ type AgentConfig = {
   env: Record<string, string>;
   contextWindow: number;
   maxTokens: number;
-  allowTools: boolean;
   metadataProvider?: string;
   modelOverrides: Record<string, ModelMetadataOverride>;
 };
@@ -40,7 +39,7 @@ const AUTO_AGENT_PRESETS: Record<string, Pick<AgentConfig, "id" | "name" | "comm
   bob: { id: "bob", name: "IBM Bob", command: "bob", args: ["acp"] },
   claude: { id: "claude", name: "Claude Agent", command: "claude-agent-acp", args: [], metadataProvider: "anthropic" },
   cline: { id: "cline", name: "Cline", command: "cline", args: ["--acp"] },
-  codebuddy: { id: "codebuddy", name: "CodeBuddy", command: "codebuddy", args: ["--acp"], metadataProvider: "codebuddy" },
+  codebuddy: { id: "codebuddy", name: "CodeBuddy", command: "codebuddy", args: ["--acp", "--tools", ""], metadataProvider: "codebuddy" },
   codex: { id: "codex", name: "Codex", command: "codex-acp", args: [], metadataProvider: "openai" },
   copilot: { id: "copilot", name: "GitHub Copilot", command: "copilot", args: ["--acp"], metadataProvider: "github-copilot" },
   cursor: { id: "cursor", name: "Cursor", command: "cursor-agent", args: ["acp"], metadataProvider: "cursor" },
@@ -110,7 +109,6 @@ function readAgents(path = resolve(process.env.PI_CODING_AGENT_DIR || `${homedir
         metadataProvider: preset.metadataProvider,
         contextWindow: DEFAULT_CONTEXT_WINDOW,
         maxTokens: DEFAULT_MAX_TOKENS,
-        allowTools: false,
         modelOverrides: {},
       });
     }
@@ -134,8 +132,6 @@ function readAgents(path = resolve(process.env.PI_CODING_AGENT_DIR || `${homedir
       throw new Error(`${label}.env must map names to strings`);
     }
     const env = Object.fromEntries(Object.entries(rawEnv).map(([key, value]) => [key, value as string]));
-    const allowTools = entry.allowTools ?? previous?.allowTools ?? false;
-    if (typeof allowTools !== "boolean") throw new Error(`${label}.allowTools must be boolean`);
     const metadataProvider = entry.metadataProvider ?? previous?.metadataProvider;
     if (metadataProvider !== undefined && (typeof metadataProvider !== "string" || !metadataProvider.trim())) {
       throw new Error(`${label}.metadataProvider must be a non-empty string`);
@@ -149,7 +145,6 @@ function readAgents(path = resolve(process.env.PI_CODING_AGENT_DIR || `${homedir
       env,
       contextWindow: positiveInteger(entry.contextWindow, previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW, `${label}.contextWindow`),
       maxTokens: positiveInteger(entry.maxTokens, previous?.maxTokens ?? DEFAULT_MAX_TOKENS, `${label}.maxTokens`),
-      allowTools,
       modelOverrides: { ...previous?.modelOverrides, ...modelOverrides },
       ...(typeof metadataProvider === "string" ? { metadataProvider } : {}),
     });
@@ -455,8 +450,8 @@ function toolNotice(update: { sessionUpdate?: string; title?: string | null; sta
   return "";
 }
 
-function permissionResponse(allowTools: boolean, options: acp.RequestPermissionRequest["options"]): acp.RequestPermissionResponse {
-  const choice = options.find(option => option.kind === (allowTools ? "allow_once" : "reject_once"));
+function allowPermissionRequest(options: acp.RequestPermissionRequest["options"]): acp.RequestPermissionResponse {
+  const choice = options.find(option => option.kind === "allow_once");
   return choice
     ? { outcome: { outcome: "selected", optionId: choice.optionId } }
     : { outcome: { outcome: "cancelled" } };
@@ -613,7 +608,7 @@ export default function ompAcpProvider(pi: ExtensionAPI) {
                 const reason = result.stopReason === "max_tokens" ? "length" : result.stopReason === "max_turn_requests" ? "toolUse" : "stop";
                 message.stopReason = reason;
               } finally { session.dispose(); }
-            }, async params => permissionResponse(agent.allowTools, params.options));
+            }, async params => allowPermissionRequest(params.options));
             const last = message.content.at(-1);
             if (last?.type === "text") stream.push({ type: "text_end", contentIndex: message.content.length - 1, content: last.text, partial: message });
             if (last?.type === "thinking") stream.push({ type: "thinking_end", contentIndex: message.content.length - 1, content: last.thinking, partial: message });
@@ -634,5 +629,5 @@ export default function ompAcpProvider(pi: ExtensionAPI) {
 export const __testing = {
   readAgents, agentModel, findCatalogModel, getRuntimeModelMetadata, readCodeBuddyRuntimeModels, readOpenCodeRuntimeModels,
   codeBuddyLocalStorageDirectory, currentModelProvider,
-  flattenPrompt, toolNotice, permissionResponse,
+  flattenPrompt, toolNotice, allowPermissionRequest,
 };

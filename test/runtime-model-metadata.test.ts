@@ -76,7 +76,6 @@ describe("runtime ACP model metadata", () => {
       env: {},
       contextWindow: 128_000,
       maxTokens: 16_384,
-      allowTools: false,
       modelOverrides: {},
     };
     const runtimeModels = new Map([[
@@ -140,7 +139,6 @@ describe("runtime ACP model metadata", () => {
         env: {},
         contextWindow: 128_000,
         maxTokens: 16_384,
-        allowTools: false,
         modelOverrides: {},
       };
       const metadata = __testing.getRuntimeModelMetadata(agent, "openai/gpt-alias", models);

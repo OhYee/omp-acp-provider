@@ -42,7 +42,7 @@ omp plugin link "$(pwd)"
 | `bob` | `bob acp` |
 | `claude` | `claude-agent-acp` |
 | `cline` | `cline --acp` |
-| `codebuddy` | `codebuddy --acp` |
+| `codebuddy` | `codebuddy --acp --tools ""`（禁用内建工具） |
 | `codex` | `codex-acp` |
 | `copilot` | `copilot --acp` |
 | `cursor` | `cursor-agent acp` |
@@ -75,22 +75,34 @@ OMP 会持久化模型目录；插件或客户端本机模型元数据更新后�
 | `id` | 必填 | 唯一 provider ID，只允许字母、数字、`_`、`-` |
 | `name` | `id` | 模型列表显示名 |
 | `command` | 必填 | ACP 可执行程序 |
-| `args` | `[]` | 命令参数数组 |
+| `args` | `[]` | 命令参数数组；覆盖自动预设时会替换整个参数列表 |
 | `env` | `{}` | 子进程环境覆盖 |
 | `contextWindow` | `128000` | OMP 的模型上下文窗口元数据 |
 | `maxTokens` | `16384` | OMP 最大输出 token 元数据；ACP 未提供通用方式强制此上限 |
 | `metadataProvider` | 无 | 用于查找 OMP 模型目录元数据的 provider ID；部分自动预设按对应模型命名空间设置 |
 | `modelOverrides` | `{}` | 按 ACP 模型选项 ID 指定模型级 `contextWindow`、`maxTokens` 和 `cost` |
-| `allowTools` | `false` | 是否自动响应 ACP 权限请求：`false` 拒绝，`true` 自动选择 `allow_once` |
 
-`command` 与 `args` 以无 shell 方式启动；ACP 子进程继承 OMP 环境变量，可用 `env` 覆盖额外变量。可在 `agents` 数组中配置多个 ACP，各自使用独立的 `id`、命令和选项。
+`command` 与 `args` 以无 shell 方式启动；ACP 子进程继承 OMP 环境变量，可用 `env` 覆盖额外变量。可在 `agents` 数组中配置多个 ACP，各自使用独立的 `id`、命令和选项。自定义 `args` 会完整替换预设参数，需保留 ACP 启动参数。
+
+CodeBuddy 的 `--tools` 支持限制其内建工具；自动预设默认传入 `--tools ""`，不向模型提供内建工具。要让模型看到选定工具，可覆盖参数，例如：
+
+```json
+{
+  "auto": { "codebuddy": true },
+  "agents": [
+    { "id": "codebuddy", "args": ["--acp", "--tools", "Read,Glob"] }
+  ]
+}
+```
+
+这只控制 CodeBuddy 内建工具是否对模型可见；如果 Agent 发起 ACP 权限请求，插件会自动选择 `allow_once`，不会弹出 OMP 审批框。
 
 只运行可信的 ACP 程序：子进程会继承 OMP 环境中的凭据，系统提示和对话历史会发送给该程序及其后端。出错时，客户端 stderr 的末尾也可能出现在 OMP 错误记录中；分享日志前请检查敏感信息。不要将包含凭据的本地配置提交到仓库。
 
 ## 能力与边界
 
-- 插件将 ACP Agent 当作完整 provider 调用。Agent 可使用自己的工具；OMP 工具不会转发给 ACP。
-- `allowTools: false` 会拒绝 ACP 权限请求；`allowTools: true` 会自动批准请求中的单次权限，不会显示 OMP 审批对话框。此设置不是沙箱，Agent 仍可能执行不经 ACP 权限请求的内建工具；只对可信程序启用。
+- ACP 没有通用参数可隐藏 Agent 自己的工具。当前自动预设只对 CodeBuddy 使用已验证的原生参数 `--tools ""` 禁用其内建工具；其他 ACP 不追加尚未验证的禁用参数，其自带工具仍可用。Agent 发起 ACP 权限请求时，插件优先选择 `allow_once`；没有该选项则返回 `cancelled`，不会弹出 OMP 审批框。OpenCode 的 `permissions` 是执行授权规则，文档没有承诺从模型请求中隐藏工具，因此不将它当作隐藏工具的开关。
+- 自动批准不是沙箱：Agent 能使用未被客户端参数禁用、且不需要 ACP 权限请求的工具；MCP 或插件工具也可能仍可用。只运行可信 ACP 程序，并使用客户端或操作系统提供的隔离能力。
 - 每次生成时，OMP 系统提示和对话历史会合并为单次 ACP 用户提示。ACP 没有通用 system prompt 字段，因此系统提示以文本形式附在 prompt 前。
 - ACP stable v1 的 `usage_update` 可报告当前上下文 token 数、窗口大小和可选的累计费用。Agent 发出该更新时，插件会记录实际窗口供后续模型刷新使用，并将报告的 USD/credits 费用写入本轮 usage；协议未提供输入/输出 token 费用拆分。
 - `contextWindow` 与 `maxTokens` 是 OMP 模型元数据，不会强制 ACP 后端使用对应限制；ACP `usage_update` 提供的窗口大小是本次会话的运行时观测值，`maxTokens` 则从客户端本机模型元数据、OMP catalog 或手动配置获取。
