@@ -1,0 +1,25 @@
+{
+  "name": "omp-acp-provider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Configure ACP agents as Oh My Pi model providers",
+  "type": "module",
+  "files": ["index.ts"],
+  "keywords": ["omp", "omp-package", "acp", "provider"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^2.4.0",
+    "@oh-my-pi/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*",
+    "@types/bun": "latest",
+    "typescript": "latest"
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
