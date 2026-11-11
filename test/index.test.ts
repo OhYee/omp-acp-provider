@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ompAcpProvider, { __testing } from "../index";
@@ -54,7 +54,7 @@ describe("ACP provider config and prompt", () => {
         ["bob", "bob", ["acp"]],
         ["claude", "claude-agent-acp", []],
         ["cline", "cline", ["--acp"]],
-        ["codebuddy", "codebuddy", ["--acp", "--tools", ""]],
+        ["codebuddy", "codebuddy", ["--acp"]],
         ["codex", "codex-acp", []],
         ["copilot", "copilot", ["--acp"]],
         ["cursor", "cursor-agent", ["acp"]],
@@ -111,6 +111,56 @@ describe("ACP provider config and prompt", () => {
         agents: [{ id: "codebuddy", args: ["--acp", "--tools", "Read,Glob"] }],
       }));
       expect(__testing.readAgents(path)[0]?.args).toEqual(["--acp", "--tools", "Read,Glob"]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  test("uses OMP instructions and tools as CodeBuddy defaults", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omp-acp-provider-"));
+    const path = join(dir, "config.json");
+    try {
+      writeFileSync(path, JSON.stringify({ auto: { codebuddy: true } }));
+      const agent = __testing.readAgents(path)[0]!;
+      const context = { systemPrompt: "OMP system rules", messages: [{ role: "user", content: "run task" }] };
+      const systemPrompt = __testing.composeOmpSystemPrompt(context, true);
+      expect(agent.args).toEqual(["--acp"]);
+      expect(systemPrompt).toContain("OMP system rules");
+      expect(systemPrompt).toContain("omp-native-tools");
+      expect(__testing.shouldUseOmpSystemPrompt(agent, systemPrompt)).toBe(true);
+      const launch = __testing.prepareAgentLaunch(agent, systemPrompt);
+      const promptPath = launch.args.at(-1)!;
+      try {
+        expect(launch.args.slice(0, agent.args.length)).toEqual(agent.args);
+        expect(launch.args.slice(agent.args.length, agent.args.length + 2)).toEqual(["--tools", ""]);
+        expect(launch.args.at(-2)).toBe("--system-prompt-file");
+        expect(readFileSync(promptPath, "utf8")).toBe(systemPrompt);
+        const prompt = __testing.flattenPrompt(context, true, true);
+        expect(prompt).not.toContain("OMP system rules");
+        expect(prompt).not.toContain("[OMP tool policy]");
+        expect(prompt).toContain("[User]");
+        expect(prompt).toContain("run task");
+      } finally { launch.cleanup(); }
+      expect(() => readFileSync(promptPath, "utf8")).toThrow();
+
+      const explicitPromptAgent = { ...agent, args: [...agent.args, "--system-prompt-file", "custom.txt"] };
+      expect(__testing.shouldUseOmpSystemPrompt(explicitPromptAgent, systemPrompt)).toBe(false);
+      expect(__testing.prepareAgentLaunch(explicitPromptAgent, systemPrompt).args).toEqual([
+        ...explicitPromptAgent.args, "--tools", "",
+      ]);
+
+      const explicitToolsAgent = { ...agent, args: [...agent.args, "--tools", "Read,Glob"] };
+      const explicitToolsLaunch = __testing.prepareAgentLaunch(explicitToolsAgent, systemPrompt);
+      try {
+        expect(explicitToolsLaunch.args.slice(0, explicitToolsAgent.args.length)).toEqual(explicitToolsAgent.args);
+        expect(explicitToolsLaunch.args.slice(explicitToolsAgent.args.length, explicitToolsAgent.args.length + 1)).toEqual(["--system-prompt-file"]);
+      } finally { explicitToolsLaunch.cleanup(); }
+      for (const policyArgs of [["--allowedTools", "Read"], ["--disallowedTools", "Bash"]]) {
+        const policyAgent = { ...agent, args: [...agent.args, ...policyArgs] };
+        const policyLaunch = __testing.prepareAgentLaunch(policyAgent, systemPrompt);
+        try {
+          expect(policyLaunch.args.slice(0, policyAgent.args.length)).toEqual(policyAgent.args);
+          expect(policyLaunch.args).not.toContain("--tools");
+          expect(policyLaunch.args.at(-2)).toBe("--system-prompt-file");
+        } finally { policyLaunch.cleanup(); }
+      }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

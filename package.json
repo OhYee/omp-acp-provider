@@ -4,7 +4,7 @@
   "private": true,
   "description": "Configure ACP agents as Oh My Pi model providers",
   "type": "module",
-  "files": ["index.ts"],
+  "files": ["index.ts", "mcp-bridge.js"],
   "keywords": ["omp", "omp-package", "acp", "provider"],
   "scripts": {
     "test": "bun test",

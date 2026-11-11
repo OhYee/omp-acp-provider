@@ -1,13 +1,16 @@
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import * as acp from "@agentclientprotocol/sdk";
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import type { ExtensionAPI, ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import type { AssistantMessage, Model as OmpModel } from "@oh-my-pi/pi-ai";
-
+import type { AssistantMessage, Model as OmpModel, Tool as OmpTool, ToolCall } from "@oh-my-pi/pi-ai";
 type ModelMetadataOverride = {
   contextWindow?: number;
   maxTokens?: number;
@@ -39,7 +42,7 @@ const AUTO_AGENT_PRESETS: Record<string, Pick<AgentConfig, "id" | "name" | "comm
   bob: { id: "bob", name: "IBM Bob", command: "bob", args: ["acp"] },
   claude: { id: "claude", name: "Claude Agent", command: "claude-agent-acp", args: [], metadataProvider: "anthropic" },
   cline: { id: "cline", name: "Cline", command: "cline", args: ["--acp"] },
-  codebuddy: { id: "codebuddy", name: "CodeBuddy", command: "codebuddy", args: ["--acp", "--tools", ""], metadataProvider: "codebuddy" },
+  codebuddy: { id: "codebuddy", name: "CodeBuddy", command: "codebuddy", args: ["--acp"], metadataProvider: "codebuddy" },
   codex: { id: "codex", name: "Codex", command: "codex-acp", args: [], metadataProvider: "openai" },
   copilot: { id: "copilot", name: "GitHub Copilot", command: "copilot", args: ["--acp"], metadataProvider: "github-copilot" },
   cursor: { id: "cursor", name: "Cursor", command: "cursor-agent", args: ["acp"], metadataProvider: "cursor" },
@@ -57,6 +60,260 @@ const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tot
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+type OmpToolRequest = { name: string; arguments: Record<string, unknown> };
+type OmpToolBridge = { mcpServer: acp.McpServer; close: () => Promise<void> };
+const MAX_TOOL_BRIDGE_REQUEST_BYTES = 1024 * 1024;
+
+function sendBridgeResponse(
+  response: ServerResponse,
+  status: number,
+  body?: unknown,
+  headers: Record<string, string> = {},
+): void {
+  const responseHeaders: Record<string, string> = {
+    "cache-control": "no-store",
+    "connection": "close",
+    "x-content-type-options": "nosniff",
+    ...headers,
+  };
+  if (body !== undefined) responseHeaders["content-type"] = "application/json; charset=utf-8";
+  response.writeHead(status, responseHeaders);
+  response.end(body === undefined ? undefined : JSON.stringify(body));
+}
+
+function bridgeRequestAuthorized(request: IncomingMessage, expected: Buffer, host: string, origin: string): boolean {
+  const address = request.socket.remoteAddress;
+  if (address !== "127.0.0.1" && address !== "::ffff:127.0.0.1") return false;
+  if (request.headers.host !== host) return false;
+  if (request.headers.origin !== undefined && request.headers.origin !== origin) return false;
+  const authorization = request.headers.authorization;
+  if (typeof authorization !== "string") return false;
+  const actual = Buffer.from(authorization);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+async function readBridgeRequestBody(request: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > MAX_TOOL_BRIDGE_REQUEST_BYTES) throw new RangeError("Tool request exceeds the size limit");
+    chunks.push(bytes);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function mcpResponse(id: unknown, result: unknown): Record<string, unknown> {
+  return { jsonrpc: "2.0", id, result };
+}
+
+function mcpError(id: unknown, code: number, message: string): Record<string, unknown> {
+  return { jsonrpc: "2.0", id, error: { code, message } };
+}
+
+function hasJsonRpcId(message: Record<string, unknown>): boolean {
+  return Object.hasOwn(message, "id");
+}
+
+async function createOmpToolBridge(
+  tools: OmpTool[],
+  onToolCall: (call: OmpToolRequest) => void,
+  transport: "http" | "stdio" = "http",
+): Promise<OmpToolBridge> {
+  const advertisedTools = tools.map(tool => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: toolWireSchema(tool),
+  }));
+  const toolsByName = new Map(advertisedTools.map(tool => [tool.name, tool]));
+  if (toolsByName.size !== advertisedTools.length) throw new Error("OMP tool names must be unique for ACP bridging");
+
+  const token = randomBytes(32).toString("hex");
+  const expectedAuthorization = Buffer.from(`Bearer ${token}`);
+  let acceptedCall = false;
+  let closed = false;
+  let bridgeHost = "";
+  let bridgeOrigin = "";
+  const supportedMcpVersions = new Set(["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]);
+  const handleMcpMessage = async (raw: unknown): Promise<Record<string, unknown> | undefined> => {
+    if (!isRecord(raw) || raw.jsonrpc !== "2.0") {
+      return mcpError(isRecord(raw) && hasJsonRpcId(raw) ? raw.id : null, -32600, "Invalid JSON-RPC request");
+    }
+    if (typeof raw.method !== "string") {
+      if (Object.hasOwn(raw, "result") || Object.hasOwn(raw, "error")) return undefined;
+      return mcpError(hasJsonRpcId(raw) ? raw.id : null, -32600, "Invalid JSON-RPC request");
+    }
+    if (!hasJsonRpcId(raw)) return undefined;
+    const id = raw.id;
+    const params = isRecord(raw.params) ? raw.params : {};
+    switch (raw.method) {
+      case "initialize": {
+        const requestedVersion = params.protocolVersion;
+        const protocolVersion = typeof requestedVersion === "string" && supportedMcpVersions.has(requestedVersion)
+          ? requestedVersion
+          : "2025-03-26";
+        return mcpResponse(id, {
+          protocolVersion,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: "omp-native-tools", version: "0.1.0" },
+        });
+      }
+      case "notifications/initialized":
+      case "ping":
+        return mcpResponse(id, {});
+      case "tools/list":
+        return mcpResponse(id, { tools: advertisedTools });
+      case "tools/call": {
+        if (typeof params.name !== "string" || !params.name || !toolsByName.has(params.name)) {
+          return mcpError(id, -32602, "Unknown OMP tool");
+        }
+        if (params.arguments !== undefined && !isRecord(params.arguments)) {
+          return mcpError(id, -32602, "Tool arguments must be an object");
+        }
+        if (acceptedCall) return mcpError(id, -32002, "An OMP tool request is already pending");
+        acceptedCall = true;
+        try {
+          onToolCall({ name: params.name, arguments: (params.arguments ?? {}) as Record<string, unknown> });
+        } catch {
+          acceptedCall = false;
+          return mcpError(id, -32603, "OMP tool request failed");
+        }
+        return mcpResponse(id, {
+          content: [{ type: "text", text: "Forwarded to OMP's native tool runner." }],
+        });
+      }
+      default:
+        return mcpError(id, -32601, "Method not found");
+    }
+  };
+  const server = createServer({ maxHeaderSize: 8192 }, async (request, response) => {
+    if (closed) {
+      sendBridgeResponse(response, 410);
+      return;
+    }
+    if (!bridgeRequestAuthorized(request, expectedAuthorization, bridgeHost, bridgeOrigin)) {
+      sendBridgeResponse(response, 401);
+      return;
+    }
+    if (transport === "http" && request.url === "/mcp" && request.method === "GET") {
+      sendBridgeResponse(response, 405, undefined, { allow: "POST" });
+      return;
+    }
+    if (transport === "http" && request.url === "/mcp" && request.method === "POST") {
+      const acceptedTypes = new Set((request.headers.accept ?? "").split(",")
+        .map(value => value.split(";", 1)[0]?.trim().toLowerCase()));
+      if (!acceptedTypes.has("application/json") || !acceptedTypes.has("text/event-stream")) {
+        sendBridgeResponse(response, 406);
+        return;
+      }
+      if (request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+        sendBridgeResponse(response, 415);
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readBridgeRequestBody(request);
+      } catch (error) {
+        sendBridgeResponse(response, error instanceof RangeError ? 413 : 400);
+        return;
+      }
+      const messages = Array.isArray(body) ? body : [body];
+      if (messages.length === 0 || messages.length > 64) {
+        sendBridgeResponse(response, 400);
+        return;
+      }
+      const responses: Record<string, unknown>[] = [];
+      for (const message of messages) {
+        const result = await handleMcpMessage(message);
+        if (result) responses.push(result);
+      }
+      if (responses.length === 0) sendBridgeResponse(response, 202);
+      else sendBridgeResponse(response, 200, Array.isArray(body) ? responses : responses[0]);
+      return;
+    }
+    if (transport === "stdio" && request.method === "GET" && request.url === "/tools") {
+      sendBridgeResponse(response, 200, { tools: advertisedTools });
+      return;
+    }
+    if (transport === "stdio" && request.method === "POST" && request.url === "/call") {
+      if (acceptedCall) {
+        sendBridgeResponse(response, 409, { accepted: false });
+        return;
+      }
+      if (request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+        sendBridgeResponse(response, 415, { accepted: false });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readBridgeRequestBody(request);
+      } catch (error) {
+        sendBridgeResponse(response, error instanceof RangeError ? 413 : 400, { accepted: false });
+        return;
+      }
+      if (!isRecord(body) || typeof body.name !== "string" || !isRecord(body.arguments) || !toolsByName.has(body.name)) {
+        sendBridgeResponse(response, 400, { accepted: false });
+        return;
+      }
+      acceptedCall = true;
+      onToolCall({ name: body.name, arguments: body.arguments });
+      sendBridgeResponse(response, 202, { accepted: true });
+      return;
+    }
+    sendBridgeResponse(response, 404);
+  });
+
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolveListen();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, "127.0.0.1");
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+    throw new Error("Could not determine the ACP tool bridge address");
+  }
+  const bridgeUrl = `http://127.0.0.1:${address.port}`;
+  bridgeHost = `127.0.0.1:${address.port}`;
+  bridgeOrigin = bridgeUrl;
+  const mcpServer: acp.McpServer = transport === "http"
+    ? {
+        type: "http",
+        name: "omp-native-tools",
+        url: `${bridgeUrl}/mcp`,
+        headers: [{ name: "Authorization", value: `Bearer ${token}` }],
+      }
+    : {
+        name: "omp-native-tools",
+        command: process.execPath,
+        args: [fileURLToPath(new URL("./mcp-bridge.js", import.meta.url))],
+        env: [
+          { name: "OMP_ACP_TOOL_BRIDGE_URL", value: bridgeUrl },
+          { name: "OMP_ACP_TOOL_BRIDGE_TOKEN", value: token },
+        ],
+      };
+
+  return {
+    mcpServer,
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      const finished = new Promise<void>(resolveClose => server.close(() => resolveClose()));
+      server.closeAllConnections?.();
+      await finished;
+    },
+  };
 }
 
 function positiveInteger(value: unknown, fallback: number, label: string): number {
@@ -424,9 +681,53 @@ function agentModel(agent: AgentConfig, modelId = agent.id, modelName = agent.na
   };
 }
 
-function flattenPrompt(context: { systemPrompt?: string | string[]; messages: unknown[] }): string {
+type PromptContext = { systemPrompt?: string | string[]; messages: unknown[] };
+const OMP_TOOL_POLICY = "For workspace and environment actions, prefer the MCP tools advertised by `omp-native-tools` over ACP client built-in tools. Make actual tool calls; never imitate them with XML, JSON, or text. If an OMP tool you need is unavailable, say so without claiming to have used it.";
+
+function promptInstructions(context: Pick<PromptContext, "systemPrompt">): string[] {
   const blocks = typeof context.systemPrompt === "string" ? [context.systemPrompt] : context.systemPrompt ?? [];
-  const lines = blocks.filter(Boolean).map(text => `[System instructions]\n${text}`);
+  return blocks.filter(text => text.trim().length > 0);
+}
+
+function composeOmpSystemPrompt(context: PromptContext, useOmpTools: boolean): string {
+  return [...(useOmpTools ? [OMP_TOOL_POLICY] : []), ...promptInstructions(context)].join("\n\n").trim();
+}
+
+function hasExplicitSystemPrompt(args: string[]): boolean {
+  return args.some(argument => ["--system-prompt", "--system-prompt-file"].some(option =>
+    argument === option || argument.startsWith(`${option}=`)));
+}
+
+function shouldUseOmpSystemPrompt(agent: AgentConfig, systemPrompt: string): boolean {
+  return agent.id === "codebuddy" && systemPrompt.trim().length > 0 && !hasExplicitSystemPrompt(agent.args);
+}
+
+const CODEBUDDY_TOOL_POLICY_OPTIONS = ["--tools", "--allowedTools", "--disallowedTools"] as const;
+
+function hasExplicitToolPolicy(args: string[]): boolean {
+  return args.some(argument => CODEBUDDY_TOOL_POLICY_OPTIONS.some(option =>
+    argument === option || argument.startsWith(`${option}=`)));
+}
+
+function prepareAgentLaunch(agent: AgentConfig, systemPrompt?: string): { args: string[]; cleanup: () => void } {
+  const args = [...agent.args];
+  if (agent.id === "codebuddy" && !hasExplicitToolPolicy(args)) args.push("--tools", "");
+  if (!systemPrompt || !shouldUseOmpSystemPrompt(agent, systemPrompt)) return { args, cleanup: () => {} };
+  const directory = mkdtempSync(join(tmpdir(), "omp-acp-provider-"));
+  try {
+    const promptPath = join(directory, "system-prompt.txt");
+    writeFileSync(promptPath, systemPrompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    args.push("--system-prompt-file", promptPath);
+    return { args, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function flattenPrompt(context: PromptContext, useOmpTools = false, omitSystemInstructions = false): string {
+  const lines = omitSystemInstructions ? [] : useOmpTools ? [`[OMP tool policy]\n${OMP_TOOL_POLICY}`] : [];
+  if (!omitSystemInstructions) lines.push(...promptInstructions(context).map(text => `[System instructions]\n${text}`));
   for (const raw of context.messages) {
     if (!raw || typeof raw !== "object") continue;
     const message = raw as { role?: string; content?: unknown; toolName?: string; toolCallId?: string; isError?: boolean };
@@ -435,8 +736,11 @@ function flattenPrompt(context: { systemPrompt?: string | string[]; messages: un
     const content = typeof message.content === "string" ? message.content : Array.isArray(message.content)
       ? message.content.map((part: unknown) => {
         if (!part || typeof part !== "object") return "";
-        const p = part as { type?: string; text?: string };
-        return p.type === "text" ? p.text ?? "" : p.type === "image" ? "[image attachment not forwarded to ACP]" : "";
+        const p = part as { type?: string; text?: string; name?: string; arguments?: unknown };
+        if (p.type === "text") return p.text ?? "";
+        if (p.type === "image") return "[image attachment not forwarded to ACP]";
+        if (p.type === "toolCall") return `[OMP tool call ${p.name ?? "unknown"}]\n${JSON.stringify(p.arguments ?? {})}`;
+        return "";
       }).filter(Boolean).join("\n") : "";
     if (content) lines.push(`[${role}]\n${content}`);
   }
@@ -458,9 +762,18 @@ function allowPermissionRequest(options: acp.RequestPermissionRequest["options"]
 }
 
 async function withAcp(agent: AgentConfig, cwd: string, signal: AbortSignal | undefined,
-  run: (connection: acp.ClientConnection["agent"]) => Promise<void>, permission: (params: acp.RequestPermissionRequest) => Promise<acp.RequestPermissionResponse>,
+  run: (connection: acp.ClientConnection["agent"], capabilities: { mcpCapabilities?: { http?: boolean; sse?: boolean } }) => Promise<void>,
+  permission: (params: acp.RequestPermissionRequest) => Promise<acp.RequestPermissionResponse>,
+  systemPrompt?: string,
 ): Promise<void> {
-  const child = spawn(agent.command, agent.args, { cwd, env: { ...process.env, ...agent.env }, shell: false, stdio: ["pipe", "pipe", "pipe"] });
+  const launch = prepareAgentLaunch(agent, systemPrompt);
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(agent.command, launch.args, { cwd, env: { ...process.env, ...agent.env }, shell: false, stdio: ["pipe", "pipe", "pipe"] });
+  } catch (error) {
+    launch.cleanup();
+    throw error;
+  }
   let stderrTail = "";
   child.stderr?.setEncoding("utf8");
   child.stderr?.on("data", chunk => { stderrTail = (stderrTail + chunk).slice(-8192); });
@@ -480,7 +793,7 @@ async function withAcp(agent: AgentConfig, cwd: string, signal: AbortSignal | un
       const initialized = await ctx.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION }, { cancellationSignal: signal });
       if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) throw new Error(`ACP protocol mismatch: expected ${acp.PROTOCOL_VERSION}, got ${initialized.protocolVersion}`);
       if (signal?.aborted) throw new Error("Request aborted");
-      await run(ctx);
+      await run(ctx, initialized.agentCapabilities ?? {});
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -493,6 +806,7 @@ async function withAcp(agent: AgentConfig, cwd: string, signal: AbortSignal | un
     killTimer?.unref();
     await closed;
     clearTimeout(killTimer);
+    launch.cleanup();
   }
 }
 
@@ -571,54 +885,95 @@ export default function ompAcpProvider(pi: ExtensionAPI) {
         const selectedModel = model.id.startsWith(`${agent.id}/`) ? model.id.slice(agent.id.length + 1) : undefined;
         const observedModelId = selectedModel ?? agent.id;
         void (async () => {
+          const outerSignal = options.signal;
+          const acpController = new AbortController();
+          const relayAbort = () => acpController.abort(outerSignal?.reason);
+          let bridge: OmpToolBridge | undefined;
+          let pendingToolCall: OmpToolRequest | undefined;
+          if (outerSignal?.aborted) relayAbort();
+          else outerSignal?.addEventListener("abort", relayAbort, { once: true });
           try {
-            const prompt = flattenPrompt(context);
+            const tools = context.tools ?? [];
+            const systemPrompt = composeOmpSystemPrompt(context, tools.length > 0);
+            const useOmpSystemPrompt = shouldUseOmpSystemPrompt(agent, systemPrompt);
+            const prompt = flattenPrompt(context, tools.length > 0, useOmpSystemPrompt);
             if (!prompt) throw new Error("ACP provider received an empty prompt");
-            await withAcp(agent, options.cwd || process.cwd(), options.signal, async ctx => {
-              const session = await ctx.buildSession(options.cwd || process.cwd()).start({ cancellationSignal: options.signal });
-              try {
-                const modelOption = session.newSessionResponse.configOptions?.find(option => option.type === "select" && (option.category === "model" || option.id === "model"));
-                if (selectedModel && modelOption?.type === "select") {
-                  await ctx.request(acp.methods.agent.session.setConfigOption, {
-                    sessionId: session.sessionId, configId: modelOption.id, value: selectedModel,
-                  }, { cancellationSignal: options.signal });
+            try {
+              await withAcp(agent, options.cwd || process.cwd(), acpController.signal, async (ctx, capabilities) => {
+                if (tools.length > 0) {
+                  bridge = await createOmpToolBridge(tools, call => {
+                    if (pendingToolCall || outerSignal?.aborted) return;
+                    pendingToolCall = call;
+                    acpController.abort();
+                  }, capabilities.mcpCapabilities?.http ? "http" : "stdio");
                 }
-                const run = session.prompt(prompt, { cancellationSignal: options.signal });
-                const updates = (async () => {
-                  for (;;) {
-                    const event = await session.nextUpdate();
-                    if (event.kind === "stop") return;
-                    const update = event.update;
-                    if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") append("text", update.content.text);
-                    else if (update.sessionUpdate === "agent_thought_chunk" && update.content?.type === "text") append("thinking", update.content.text);
-                    else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") append("text", toolNotice({ sessionUpdate: update.sessionUpdate, title: update.title, status: update.status }));
-                    else if (update.sessionUpdate === "usage_update") {
-                      if (Number.isInteger(update.size) && update.size > 0) observedContextWindows.set(observedModelId, update.size);
-                      if (Number.isInteger(update.used) && update.used >= 0) message.usage.contextTokens = update.used;
-                      if (update.cost && Number.isFinite(update.cost.amount) && update.cost.amount >= 0) {
-                        if (update.cost.currency.toUpperCase() === "USD") message.usage.cost.total = update.cost.amount;
-                        else if (update.cost.currency.toLowerCase() === "credits") message.usage.credits = { cost: update.cost.amount };
+                const builder = ctx.buildSession(options.cwd || process.cwd());
+                if (bridge) builder.withMcpServer(bridge.mcpServer);
+                const session = await builder.start({ cancellationSignal: acpController.signal });
+                try {
+                  const modelOption = session.newSessionResponse.configOptions?.find(option => option.type === "select" && (option.category === "model" || option.id === "model"));
+                  if (selectedModel && modelOption?.type === "select") {
+                    await ctx.request(acp.methods.agent.session.setConfigOption, {
+                      sessionId: session.sessionId, configId: modelOption.id, value: selectedModel,
+                    }, { cancellationSignal: acpController.signal });
+                  }
+                  const run = session.prompt(prompt, { cancellationSignal: acpController.signal });
+                  const updates = (async () => {
+                    for (;;) {
+                      const event = await session.nextUpdate();
+                      if (event.kind === "stop") return;
+                      const update = event.update;
+                      if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") append("text", update.content.text);
+                      else if (update.sessionUpdate === "agent_thought_chunk" && update.content?.type === "text") append("thinking", update.content.text);
+                      else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") append("text", toolNotice({ sessionUpdate: update.sessionUpdate, title: update.title, status: update.status }));
+                      else if (update.sessionUpdate === "usage_update") {
+                        if (Number.isInteger(update.size) && update.size > 0) observedContextWindows.set(observedModelId, update.size);
+                        if (Number.isInteger(update.used) && update.used >= 0) message.usage.contextTokens = update.used;
+                        if (update.cost && Number.isFinite(update.cost.amount) && update.cost.amount >= 0) {
+                          if (update.cost.currency.toUpperCase() === "USD") message.usage.cost.total = update.cost.amount;
+                          else if (update.cost.currency.toLowerCase() === "credits") message.usage.credits = { cost: update.cost.amount };
+                        }
                       }
                     }
-                  }
-                })();
-                const [result] = await Promise.all([run, updates]);
-                if (result.stopReason === "cancelled") throw new Error("ACP agent cancelled the turn");
-                if (result.stopReason === "refusal") throw new Error("ACP agent refused the prompt");
-                const reason = result.stopReason === "max_tokens" ? "length" : result.stopReason === "max_turn_requests" ? "toolUse" : "stop";
-                message.stopReason = reason;
-              } finally { session.dispose(); }
-            }, async params => allowPermissionRequest(params.options));
+                  })();
+                  const [result] = await Promise.all([run, updates]);
+                  if (result.stopReason === "cancelled") throw new Error("ACP agent cancelled the turn");
+                  if (result.stopReason === "refusal") throw new Error("ACP agent refused the prompt");
+                  // ACP max_turn_requests is an agent-side request limit, not an OMP tool call.
+                  message.stopReason = result.stopReason === "max_tokens" ? "length" : "stop";
+                } finally { session.dispose(); }
+              }, async params => allowPermissionRequest(params.options), useOmpSystemPrompt ? systemPrompt : undefined);
+            } catch (error) {
+              if (!pendingToolCall || outerSignal?.aborted) throw error;
+            }
             const last = message.content.at(-1);
             if (last?.type === "text") stream.push({ type: "text_end", contentIndex: message.content.length - 1, content: last.text, partial: message });
             if (last?.type === "thinking") stream.push({ type: "thinking_end", contentIndex: message.content.length - 1, content: last.thinking, partial: message });
+            if (pendingToolCall) {
+              const toolCall: ToolCall = {
+                type: "toolCall",
+                id: randomUUID(),
+                name: pendingToolCall.name,
+                arguments: pendingToolCall.arguments,
+              };
+              const contentIndex = message.content.length;
+              message.content.push(toolCall);
+              stream.push({ type: "toolcall_start", contentIndex, partial: message });
+              stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(toolCall.arguments), partial: message });
+              stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: message });
+              message.stopReason = "toolUse";
+            }
             stream.push({ type: "done", reason: message.stopReason === "length" || message.stopReason === "toolUse" ? message.stopReason : "stop", message });
           } catch (error) {
-            const aborted = options.signal?.aborted === true;
+            const aborted = outerSignal?.aborted === true;
             message.stopReason = aborted ? "aborted" : "error";
             message.errorMessage = error instanceof Error ? error.message : String(error);
             stream.push({ type: "error", reason: message.stopReason, error: message });
-          } finally { stream.end(message); }
+          } finally {
+            outerSignal?.removeEventListener("abort", relayAbort);
+            await bridge?.close();
+            stream.end(message);
+          }
         })();
         return stream;
       },
@@ -629,5 +984,5 @@ export default function ompAcpProvider(pi: ExtensionAPI) {
 export const __testing = {
   readAgents, agentModel, findCatalogModel, getRuntimeModelMetadata, readCodeBuddyRuntimeModels, readOpenCodeRuntimeModels,
   codeBuddyLocalStorageDirectory, currentModelProvider,
-  flattenPrompt, toolNotice, allowPermissionRequest,
+  flattenPrompt, promptInstructions, composeOmpSystemPrompt, shouldUseOmpSystemPrompt, prepareAgentLaunch, toolNotice, allowPermissionRequest, createOmpToolBridge,
 };
